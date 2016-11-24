@@ -29,6 +29,7 @@ import scala.util.Sorting
 
 import com.esotericsoftware.kryo.io.{Input, Output}
 import com.esotericsoftware.kryo.{Kryo, KryoSerializable}
+import com.fasterxml.jackson.core.JsonGenerator
 import com.ning.compress.lzf.{LZFDecoder, LZFEncoder}
 import com.pivotal.gemfirexd.internal.engine.jdbc.GemFireXDRuntimeException
 import io.snappydata.{Constant, ToolsCallback}
@@ -43,13 +44,15 @@ import org.apache.spark.scheduler.local.LocalSchedulerBackend
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.expressions.GenericRow
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
-import org.apache.spark.sql.catalyst.util.{ArrayData, DateTimeUtils, MapData}
+import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.execution.datasources.jdbc.{DriverRegistry, DriverWrapper}
+import org.apache.spark.sql.execution.datasources.json.JacksonGenerator
 import org.apache.spark.sql.hive.SnappyStoreHiveCatalog
 import org.apache.spark.sql.sources.CastLongTime
 import org.apache.spark.sql.types._
 import org.apache.spark.storage.{BlockId, BlockManager, BlockManagerId}
+import org.apache.spark.util.AccumulatorV2
 import org.apache.spark.util.collection.BitSet
 import org.apache.spark.util.io.ChunkedByteBuffer
 import org.apache.spark.{Logging, Partition, Partitioner, SparkConf, SparkContext, SparkEnv, TaskContext}
@@ -461,91 +464,6 @@ object Utils {
     }
   }
 
-  def dataTypeStringBuilder(dataType: DataType,
-      result: StringBuilder): Any => Unit = value => {
-    dataType match {
-      case TimestampType => value match {
-        case l: Long => result.append(DateTimeUtils.toJavaTimestamp(l))
-        case _ => result.append(value)
-      }
-      case DateType => value match {
-        case i: Int => result.append(DateTimeUtils.toJavaDate(i))
-        case _ => result.append(value)
-      }
-      case ArrayType(elementType, _) => value match {
-        case data: ArrayData =>
-          result.append('[')
-          val len = data.numElements()
-          if (len > 0) {
-            val elementBuilder = dataTypeStringBuilder(elementType, result)
-            elementBuilder(data.get(0, elementType))
-            var index = 1
-            while (index < len) {
-              result.append(", ")
-              elementBuilder(data.get(index, elementType))
-              index += 1
-            }
-          }
-          result.append(']')
-
-        case _ => result.append(value)
-      }
-      case MapType(keyType, valueType, _) => value match {
-        case data: MapData =>
-          result.append('[')
-          val len = data.numElements()
-          if (len > 0) {
-            val keyBuilder = dataTypeStringBuilder(keyType, result)
-            val valueBuilder = dataTypeStringBuilder(valueType, result)
-            val keys = data.keyArray()
-            val values = data.valueArray()
-            keyBuilder(keys.get(0, keyType))
-            result.append('=')
-            valueBuilder(values.get(0, valueType))
-            var index = 1
-            while (index < len) {
-              result.append(", ")
-              keyBuilder(keys.get(index, keyType))
-              result.append('=')
-              valueBuilder(values.get(index, valueType))
-              index += 1
-            }
-          }
-          result.append(']')
-
-        case _ => result.append(value)
-      }
-      case StructType(fields) => value match {
-        case data: InternalRow =>
-          result.append('[')
-          val len = fields.length
-          if (len > 0) {
-            val e0type = fields(0).dataType
-            dataTypeStringBuilder(e0type, result)(data.get(0, e0type))
-            var index = 1
-            while (index < len) {
-              result.append(", ")
-              val elementType = fields(index).dataType
-              dataTypeStringBuilder(elementType, result)(
-                data.get(index, elementType))
-              index += 1
-            }
-          }
-          result.append(']')
-
-        case _ => result.append(value)
-      }
-      case udt: UserDefinedType[_] =>
-        // check if serialized
-        if (value != null && !udt.userClass.isInstance(value)) {
-          result.append(udt.deserialize(value))
-        } else {
-          result.append(value)
-        }
-      case _ => result.append(value)
-    }
-  }
-
   def getDriverClassName(url: String): String = DriverManager.getDriver(url) match {
     case wrapper: DriverWrapper => wrapper.wrapped.getClass.getCanonicalName
     case driver => driver.getClass.getCanonicalName
@@ -679,6 +597,22 @@ object Utils {
       setDefaultConfProperty(conf, "spark.io.compression.codec",
         Constant.DEFAULT_CODEC)
     }
+  }
+
+  def metricMethods(sc: SparkContext): (String => String, String => String) = {
+    SnappyContext.getClusterMode(sc) match {
+      case SnappyEmbeddedMode(_, _) | LocalMode(_, _) =>
+        (v => s"addLong($v)", v => s"$v.longValue()")
+      case _ =>
+        (v => s"add($v)",
+            // explicit cast for value to Object is for janino bug
+            v => s"(Long)((${classOf[AccumulatorV2[_, _]]})$v).value()")
+    }
+  }
+
+  def generateJson(dataType: DataType, gen: JsonGenerator,
+      row: InternalRow): Unit = {
+    JacksonGenerator(StructType(Seq(StructField("", dataType))), gen)(row)
   }
 }
 
